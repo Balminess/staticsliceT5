@@ -1,0 +1,20 @@
+# 忽略所有数据文件，但保留README和.gitkeep
+# Ignore all data files, but keep README and .gitkeep files
+
+# 忽略JSONL数据文件
+*.jsonl
+
+# 忽略临时文件夹
+temp/
+
+# 忽略压缩文件
+*.zip
+*.tar.gz
+*.tar
+*.rar
+
+# 保留README文件
+!README.md
+
+# 保留.gitkeep文件
+!.gitkeep
