@@ -1,7 +1,6 @@
 import torch
 from transformers import T5ForConditionalGeneration
 from torch import nn
-from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Any, List
 from transformers import T5Config
 from transformers import GenerationMixin
@@ -10,44 +9,11 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-class CopyMechModule(nn.Module):
-    
-    def __init__(self, transformer_hidden_size, vocab_size):
-        super().__init__()
-        self.p_gen_head = nn.Sequential(
-            nn.Linear(transformer_hidden_size * 2, 1),
-            nn.Sigmoid(),
-        )
-        self.vocab_size = 32110 #vocab_size
-    
-    def forward(
-        self,
-        decoder_input_embeds: torch.FloatTensor,         # shape: (B, T, H)
-        decoder_output: torch.FloatTensor,               # shape: (B, T, H)
-        cross_attentions: torch.FloatTensor,             # shape: (B, T, S)
-        input_ids_to_copy: torch.LongTensor,                 # shape: (B, S)
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-
-        batch_size, seq_length = input_ids_to_copy.size(0), input_ids_to_copy.size(1)
-        total_states = torch.cat((decoder_input_embeds, decoder_output), dim=-1)
-        p_gen = self.p_gen_head(total_states)
-        input_one_hot = input_ids_to_copy.new_zeros(batch_size, seq_length, self.vocab_size)
-        input_one_hot.scatter_(-1, input_ids_to_copy[:, :, None], 1)
-        input_one_hot = input_one_hot.float()
-        logits = cross_attentions @ input_one_hot
-        return p_gen, logits
-
-
-@dataclass
-class Seq2SeqLMOutputWithSrcIds(Seq2SeqLMOutput):
-    src_input_ids: Optional[Tuple[torch.LongTensor]] = None
-
 
 class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
-    
+
     def __init__(self, config: T5Config):
         super().__init__(config)
-        self.copy_module = CopyMechModule(config.d_model, config.vocab_size)
         self.post_init()
     
     def _prepare_encoder_decoder_kwargs_for_generation(self, inputs_tensor: torch.Tensor, model_kwargs, model_input_name: Optional[str] = None) -> Dict[str, Any]:
@@ -67,8 +33,7 @@ class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
         encoder_kwargs["return_dict"] = True
         encoder_kwargs[model_input_name] = inputs_tensor
         model_kwargs["encoder_outputs"]: ModelOutput = encoder(**encoder_kwargs)
-        model_kwargs["src_input_ids"] = inputs_tensor
-        
+
         return model_kwargs
     
     def _expand_inputs_for_generation(
@@ -92,10 +57,6 @@ class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
         if attention_mask is not None:
             model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
 
-        if "src_input_ids" in model_kwargs:
-            src_input_ids = model_kwargs["src_input_ids"]
-            model_kwargs["src_input_ids"] = src_input_ids.index_select(0, expanded_return_idx)
-        
         if is_encoder_decoder:
             if encoder_outputs is None:
                 raise ValueError("If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.")
@@ -123,7 +84,6 @@ class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
 
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
-            "src_input_ids": kwargs["src_input_ids"],
             "encoder_outputs": encoder_outputs,
             "past_key_values": past,
             "decoder_input_ids": decoder_input_ids,
@@ -137,7 +97,6 @@ class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        src_input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.LongTensor] = None,
         decoder_attention_mask: Optional[torch.LongTensor] = None,
@@ -208,7 +167,7 @@ class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
             head_mask=decoder_head_mask,
             cross_attn_head_mask=cross_attn_head_mask,
             use_cache=use_cache,
-            output_attentions=True,
+            output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
@@ -222,23 +181,8 @@ class T5ForConditionalGenerationWithCopyMech(T5ForConditionalGeneration):
 
         lm_logits = self.lm_head(outputs)
         # lm_logits = lm_logits + self.final_logits_bias.to(lm_logits.device)
-        
-        if labels is not None:
-            # Training
-            # decoder_input_ids = decoder_input_ids[:, :-1] #this line cause [4,255,768]
-            decoder_input_embeds = self.decoder.embed_tokens(decoder_input_ids)
-            # decoder_input_embeds *= self.decoder.embed_scale # T5 noscale
 
-            cross_attentions = decoder_outputs.cross_attentions[-1].mean(dim=1)  # (B, T, S)
-
-            p_gen, cp_logits = self.copy_module.forward(
-                decoder_input_embeds,            # decoder input embeds
-                outputs,                         # decoder output
-                cross_attentions,               # attention
-                input_ids                        # encoder input ids
-            )
-            p_copy = 1 - p_gen
-            logits = p_gen * lm_logits + p_copy * cp_logits
+        logits = lm_logits
 
         loss = None
         if labels is not None:
